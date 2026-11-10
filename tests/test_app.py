@@ -127,6 +127,46 @@ class WindowTest(unittest.TestCase):
         self.assertIn('已跳过', self.window.log.toPlainText())
         self.window.jobs.clear()
 
+    def test_local_mkdir_and_invalid_name(self):
+        with patch.object(app.QInputDialog, 'getText', return_value=("中文 ' folder", True)):
+            self.window.create_local_directory()
+        self.assertTrue((Path(self.temp.name) / "中文 ' folder").is_dir())
+        for name in ('../escape', '.', '', 'bad\nname'):
+            with patch.object(app.QInputDialog, 'getText', return_value=(name, True)), \
+                    patch.object(app.QMessageBox, 'warning') as warning:
+                self.window.create_local_directory()
+                warning.assert_called_once()
+
+    def test_remote_mkdir_refreshes_after_success(self):
+        self.window.connected = True
+        self.window.remote_dir = '/userdata'
+        with patch.object(app.QInputDialog, 'getText', return_value=('中文 folder', True)), \
+                patch.object(app, 'backend_command', return_value=child('print("created")')) as command, \
+                patch.object(self.window, 'request_listing') as refresh:
+            self.window.create_remote_directory()
+            self.assertEqual(self.window.current_job['path'], '/userdata/中文 folder')
+            self.wait_for(lambda: refresh.called)
+        command.assert_called_once_with('mkdir', '/dev/serial-transfer-no-such-device', '保持当前')
+        refresh.assert_called_once_with('/userdata')
+
+    def test_overwrite_confirmation_yes_and_no(self):
+        target = Path(self.temp.name) / 'existing'
+        target.write_bytes(b'old')
+        for action in ('send', 'receive'):
+            self.window.remote_entries = [dict(name='existing', kind='file')]
+            self.window.remote_dir = '/userdata'
+            for answer in (app.QMessageBox.StandardButton.No, app.QMessageBox.StandardButton.Yes):
+                self.window.enqueue(action, str(target), '/userdata/existing', 3)
+                with patch.object(app.QMessageBox, 'question', return_value=answer), \
+                        patch.object(self.window, 'launch') as launch:
+                    self.window.start_next()
+                if answer == app.QMessageBox.StandardButton.Yes:
+                    self.assertIn('--overwrite', launch.call_args.args[0])
+                else:
+                    launch.assert_not_called()
+                    self.assertIn('保留原文件', self.window.queue_table.item(self.window.queue_table.rowCount() - 1, 4).text())
+        self.assertEqual(target.read_bytes(), b'old')
+
     def test_zero_exit_without_listing_does_not_connect(self):
         with patch.object(app, 'backend_command', return_value=child('print("no listing")')):
             self.window.connect_board()

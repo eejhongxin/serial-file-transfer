@@ -182,6 +182,81 @@ class TransferTest(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b'created by someone else')
         self.assertEqual(list(self.root.glob('.serial-transfer.*')), [])
 
+    def test_explicit_overwrite_both_directions(self):
+        for action in ('send', 'receive'):
+            source, target = self.root / 'source', self.root / 'target'
+            source.write_bytes(b'new contents')
+            target.write_bytes(b'old contents')
+            with Shell() as shell:
+                args = self.args(shell, source if action == 'send' else str(source),
+                                 str(target) if action == 'send' else target)
+                args.overwrite = True
+                getattr(backend, action + '_file')(args, self.parser)
+            self.assertEqual(target.read_bytes(), b'new contents')
+
+    def test_overwrite_checksum_failure_preserves_old_files(self):
+        for action in ('send', 'receive'):
+            source, target = self.root / 'source', self.root / 'target'
+            source.write_bytes(b'original source')
+            target.write_bytes(b'old contents')
+            def corrupt(command):
+                if action == 'receive' and '; gzip -1 -c ' in command:
+                    source.write_bytes(b'changed source')
+                if action == 'send' and 'sha256sum < ' in command:
+                    for staged in self.root.glob('.serial-transfer.*/data'):
+                        staged.write_bytes(b'corrupt')
+            with Shell(corrupt) as shell:
+                args = self.args(shell, source if action == 'send' else str(source),
+                                 str(target) if action == 'send' else target)
+                args.overwrite = True
+                with self.assertRaisesRegex(RuntimeError, 'checksum or size mismatch'):
+                    getattr(backend, action + '_file')(args, self.parser)
+            self.assertEqual(target.read_bytes(), b'old contents')
+            self.assertEqual(list(self.root.glob('.serial-transfer.*')), [])
+
+    def test_overwrite_symlink_replaces_link_only(self):
+        source, referent = self.root / 'source', self.root / 'referent'
+        source.write_bytes(b'new')
+        referent.write_bytes(b'keep referent')
+        for action in ('send', 'receive'):
+            target = self.root / ('link-' + action)
+            target.symlink_to(referent)
+            with Shell() as shell:
+                args = self.args(shell, source if action == 'send' else str(source),
+                                 str(target) if action == 'send' else target)
+                args.overwrite = True
+                getattr(backend, action + '_file')(args, self.parser)
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(target.read_bytes(), b'new')
+            self.assertEqual(referent.read_bytes(), b'keep referent')
+
+    def test_overwrite_refuses_directory(self):
+        source, target = self.root / 'source', self.root / 'folder'
+        source.write_bytes(b'new')
+        target.mkdir()
+        (target / 'keep').write_bytes(b'keep')
+        for action in ('send', 'receive'):
+            with Shell() as shell:
+                args = self.args(shell, source if action == 'send' else str(source),
+                                 str(target) if action == 'send' else target)
+                args.overwrite = True
+                with self.assertRaises((RuntimeError, SystemExit)):
+                    getattr(backend, action + '_file')(args, self.parser)
+        self.assertEqual((target / 'keep').read_bytes(), b'keep')
+
+    def test_mkdir_cli_unicode_quotes_and_existing_failure(self):
+        target = self.root / "中文 ' $ 文件夹"
+        with Shell() as shell:
+            command = [sys.executable, str(MODULE), 'mkdir', '--port', shell.port,
+                       '--events', '--path', str(target)]
+            result = REAL_RUN(command, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue(target.is_dir())
+            result = REAL_RUN(command, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(shell.attributes(), shell.original)
+        self.assertEqual(list(self.root.iterdir()), [target])
+
     def test_keyboard_interrupt_restores_console(self):
         with Shell() as shell:
             with self.assertRaises(KeyboardInterrupt):

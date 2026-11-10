@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-release_name='serial-transfer-gui-2.0.0'
+release_name='serial-transfer-gui-2.1.0'
 work_dir="$(mktemp -d)"
 trap 'rm -rf -- "$work_dir"' EXIT
 mkdir -p -- "$work_dir/$release_name" "$source_dir/dist"

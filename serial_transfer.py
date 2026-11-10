@@ -267,8 +267,12 @@ def list_directory(args, parser):
 def receive_file(args, parser):
     if any(character in args.source for character in '\r\n\0'):
         parser.error('Transfer paths cannot contain CR, LF or NUL characters')
+    overwrite = getattr(args, 'overwrite', False)
     if os.path.lexists(args.output):
-        parser.error('Output already exists; choose another output name')
+        if not overwrite:
+            parser.error('Output already exists; choose another output name')
+        if args.output.is_dir() or not (args.output.is_file() or args.output.is_symlink()):
+            parser.error('Output must be a file or file symlink, not a directory or special file')
     if not args.output.parent.is_dir():
         parser.error('Output directory does not exist')
     source = shlex.quote(args.source)
@@ -295,8 +299,11 @@ def receive_file(args, parser):
             output.write(raw)
             output.flush()
             os.fsync(output.fileno())
-        # Publish atomically without overwriting an existing destination.
-        os.link(temporary, args.output)
+        # Publish only after validation; replace the link itself, never its referent.
+        if overwrite:
+            os.replace(temporary, args.output)
+        else:
+            os.link(temporary, args.output)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -329,10 +336,18 @@ def send_file(args, parser):
         move_help = console.checked_command('mv --help 2>&1')
         if b'-T' not in move_help:
             raise RuntimeError('Board mv must support -T (treat the output as a file)')
-        move_options = '-nT --no-copy' if b'--no-copy' in move_help else '-nT'
+        overwrite = getattr(args, 'overwrite', False)
+        move_options = '-fT' if overwrite else '-nT'
+        if b'--no-copy' in move_help:
+            move_options += ' --no-copy'
+        if overwrite:
+            console.checked_command(
+                f'if [ -d {destination} ] || {{ [ -e {destination} ] && '
+                f'[ ! -f {destination} ] && [ ! -L {destination} ]; }}; then '
+                "echo 'Output is a directory or special file'; exit 1; fi")
         console.checked_command(
-            f'if [ -e {destination} ] || [ -L {destination} ]; then '
-            "echo 'Output already exists; choose another board output name'; exit 1; fi; "
+            ('' if overwrite else f'if [ -e {destination} ] || [ -L {destination} ]; then '
+            "echo 'Output already exists; choose another board output name'; exit 1; fi; ") +
             f'test -d {parent}')
         template = shlex.quote(str(Path(args.output).parent / '.serial-transfer.XXXXXX'))
         temporary = console.checked_command('mktemp -d ' + template).decode().strip()
@@ -389,6 +404,14 @@ def send_file(args, parser):
     print(f'Elapsed: {time.monotonic() - started:.1f} seconds')
 
 
+def make_directory(args, parser):
+    if not args.path.startswith('/') or any(c in args.path for c in '\r\n\0'):
+        parser.error('Directory must be an absolute path without CR, LF or NUL')
+    with Console(args.port, getattr(args, 'baud', None)) as console:
+        console.checked_command('mkdir -- ' + shlex.quote(args.path))
+    emit_event('status', message='板端文件夹已创建：' + args.path)
+
+
 def main():
     global _EVENTS
     parser = argparse.ArgumentParser(description=__doc__)
@@ -406,6 +429,8 @@ def main():
                              help='Local file' if name == 'send' else 'Board file')
         command.add_argument('--output', required=True, type=str if name == 'send' else Path,
                              help='Board file (absolute path)' if name == 'send' else 'Local file')
+        command.add_argument('--overwrite', action='store_true',
+                             help='Replace an existing file only after successful verification')
         command.set_defaults(action=action, command_parser=command)
     listing = commands.add_parser('list', help='List one board directory without recursion')
     listing.add_argument('--port', default='/dev/ttyACM0', help='Local serial device')
@@ -414,6 +439,12 @@ def main():
     listing.add_argument('--events', action='store_true')
     listing.add_argument('--path', required=True, help='Absolute board directory')
     listing.set_defaults(action=list_directory, command_parser=listing)
+    mkdir = commands.add_parser('mkdir', help='Create one board directory')
+    mkdir.add_argument('--port', default='/dev/ttyACM0')
+    mkdir.add_argument('--baud', type=int, default=None)
+    mkdir.add_argument('--events', action='store_true')
+    mkdir.add_argument('--path', required=True)
+    mkdir.set_defaults(action=make_directory, command_parser=mkdir)
     arguments = sys.argv[1:]
     if Path(sys.argv[0]).name == 'serial-receive':
         arguments = ['receive', *arguments]

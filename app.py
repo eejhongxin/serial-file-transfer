@@ -17,7 +17,7 @@ from PySide6.QtGui import QAction, QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFileIconProvider,
     QFileSystemModel, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QInputDialog, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QSizePolicy, QSplitter, QStyle, QTabWidget, QTableWidget, QTableWidgetItem,
     QTreeView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -43,7 +43,7 @@ def backend_command(action, port, baud):
     return command
 
 
-def transfer_command(direction, port, baud, local, remote):
+def transfer_command(direction, port, baud, local, remote, overwrite=False):
     if direction not in ('send', 'receive'):
         raise ValueError('请选择传输方向。')
     if not remote.startswith('/') or remote.endswith('/') or any(c in remote for c in '\r\n\x00'):
@@ -54,12 +54,14 @@ def transfer_command(direction, port, baud, local, remote):
     if direction == 'send' and not path.is_file():
         raise ValueError('要上传的本地文件不存在。')
     if direction == 'receive':
-        if os.path.lexists(path):
+        if os.path.lexists(path) and not overwrite:
             raise ValueError('本地目标已存在，请更换文件名。')
+        if path.is_dir():
+            raise ValueError('目标是文件夹，不能用文件覆盖。')
         if not path.parent.is_dir():
             raise ValueError('本地保存目录不存在。')
     source, output = (str(path), remote) if direction == 'send' else (remote, str(path))
-    return backend_command(direction, port, baud) + ['--source', source, '--output', output]
+    return backend_command(direction, port, baud) + ['--source', source, '--output', output] + (['--overwrite'] if overwrite else [])
 
 
 def human_size(size):
@@ -222,7 +224,7 @@ class Application(QMainWindow):
         self.cancel_button.setEnabled(False)
         bottom.addWidget(self.cancel_button)
         layout.addLayout(bottom)
-        self.statusBar().showMessage('SHA256 校验 · 拒绝覆盖同名文件 · 按需读取板端目录')
+        self.statusBar().showMessage('SHA256 校验 · 覆盖前确认 · 按需读取板端目录')
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_elapsed)
         self.timer.start(1000)
@@ -297,6 +299,9 @@ class Application(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 5, 0)
         row, self.upload_button = self.panel_header('本地站点', '上传 →', self.upload_selected)
+        mkdir_button = QPushButton('新建文件夹')
+        mkdir_button.clicked.connect(self.create_local_directory)
+        row.insertWidget(2, mkdir_button)
         layout.addLayout(row)
         navigation = QHBoxLayout()
         up = QPushButton('上一级')
@@ -345,6 +350,9 @@ class Application(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(5, 0, 0, 0)
         row, self.download_button = self.panel_header('远程站点 · 开发板', '← 下载', self.download_selected)
+        self.remote_mkdir_button = QPushButton('新建文件夹')
+        self.remote_mkdir_button.clicked.connect(self.create_remote_directory)
+        row.insertWidget(2, self.remote_mkdir_button)
         layout.addLayout(row)
         navigation = QHBoxLayout()
         self.remote_up = QPushButton('上一级')
@@ -383,6 +391,7 @@ class Application(QMainWindow):
         action = menu.addAction('上传所选文件 →')
         action.setEnabled(self.connected and self.process is None)
         action.triggered.connect(self.upload_selected)
+        menu.addAction('新建文件夹…', self.create_local_directory)
         menu.exec(self.local_tree.viewport().mapToGlobal(position))
 
     def remote_context_menu(self, position):
@@ -390,7 +399,44 @@ class Application(QMainWindow):
         action = menu.addAction('← 下载所选文件')
         action.setEnabled(self.connected and self.process is None)
         action.triggered.connect(self.download_selected)
+        mkdir = menu.addAction('新建文件夹…', self.create_remote_directory)
+        mkdir.setEnabled(self.connected and self.process is None)
         menu.exec(self.remote_tree.viewport().mapToGlobal(position))
+
+    def directory_name(self):
+        name, accepted = QInputDialog.getText(self, '新建文件夹', '文件夹名称：')
+        if not accepted:
+            return None
+        if not name or name in ('.', '..') or ('/' in name or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+            QMessageBox.warning(self, '名称无效', '请输入单个文件夹名称，不能包含 /、换行或控制字符。')
+            return None
+        return name
+
+    def create_local_directory(self):
+        name = self.directory_name()
+        if name is None:
+            return
+        try:
+            (Path(self.local_dir) / name).mkdir()
+        except OSError as error:
+            QMessageBox.warning(self, '创建失败', str(error))
+            return
+        self.navigate_local(self.local_dir)
+        self.status_label.setText('本地文件夹已创建：' + name)
+
+    def create_remote_directory(self):
+        if not self.connected or self.process is not None:
+            return
+        name = self.directory_name()
+        if name is None:
+            return
+        path = str(PurePosixPath(self.remote_dir) / name)
+        try:
+            command = backend_command('mkdir', self.port_box.currentText().strip(), self.baud_box.currentText())
+        except ValueError as error:
+            QMessageBox.warning(self, '创建失败', str(error))
+            return
+        self.launch(command + ['--path', path], {'action': 'mkdir', 'path': path})
 
     def append_log(self, message):
         self.log.appendPlainText(time.strftime('%H:%M:%S  ') + message.rstrip())
@@ -561,9 +607,36 @@ class Application(QMainWindow):
                 self.request_listing(self.remote_dir)
             return
         job = self.jobs.pop(0)
+        if job['action'] == 'receive':
+            exists = os.path.lexists(job['local'])
+            directory = Path(job['local']).is_dir()
+            target = job['local']
+        else:
+            entry = next((e for e in self.remote_entries
+                          if str(PurePosixPath(self.remote_dir) / e['name']) == job['remote']), None)
+            exists = entry is not None
+            directory = exists and self.is_directory(entry)
+            target = job['remote']
+        overwrite = False
+        if exists:
+            if directory:
+                self.queue_table.item(job['row'], 4).setText('已跳过：目标是文件夹')
+                self.append_log('不能用文件覆盖文件夹：' + target)
+                QTimer.singleShot(0, self.start_next)
+                return
+            answer = QMessageBox.question(self, '覆盖同名文件？',
+                '目标文件已存在：\n' + display_name(target) +
+                '\n\n是否覆盖？传输并校验成功后才会替换原文件。符号链接将替换链接本身。',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                self.queue_table.item(job['row'], 4).setText('已跳过：保留原文件')
+                QTimer.singleShot(0, self.start_next)
+                return
+            overwrite = True
         try:
             command = transfer_command(job['action'], self.port_box.currentText().strip(),
-                                       self.baud_box.currentText(), job['local'], job['remote'])
+                                       self.baud_box.currentText(), job['local'], job['remote'], overwrite=overwrite)
         except ValueError as error:
             self.queue_table.item(job['row'], 4).setText('失败：目标已存在' if '已存在' in str(error) else '无法开始')
             self.append_log(str(error))
@@ -585,9 +658,9 @@ class Application(QMainWindow):
         self.process.started.connect(self.process_started)
         self.process.finished.connect(self.operation_finished)
         self.process.errorOccurred.connect(self.process_error)
-        self.append_log(('读取板端目录：' + job['path']) if job['action'] == 'list' else
+        self.append_log((('读取板端目录：' if job['action'] == 'list' else '新建板端文件夹：') + job['path']) if job['action'] in ('list', 'mkdir') else
                         ('上传：' if job['action'] == 'send' else '下载：') + job['remote'])
-        self.status_label.setText('正在读取目录…' if job['action'] == 'list' else '正在传输…')
+        self.status_label.setText('正在读取目录…' if job['action'] == 'list' else ('正在创建文件夹…' if job['action'] == 'mkdir' else '正在传输…'))
         self.update_controls()
         self.process.start(command[0], command[1:])
 
@@ -656,6 +729,12 @@ class Application(QMainWindow):
                 self.remote_path.setText(self.remote_dir)
                 self.status_label.setText('操作已取消' if self.cancel_requested else '目录读取失败，请查看日志')
                 self.tabs.setCurrentIndex(1)
+        elif job['action'] == 'mkdir':
+            self.status_label.setText('文件夹创建成功' if success else ('操作已取消' if self.cancel_requested else '创建失败，请查看日志'))
+            if success:
+                self.refresh_after_queue = True
+            else:
+                self.tabs.setCurrentIndex(1)
         else:
             text = '完成 · 校验通过' if success else ('已取消' if self.cancel_requested else '失败 · 查看日志')
             self.queue_table.item(job['row'], 4).setText(text)
@@ -665,7 +744,7 @@ class Application(QMainWindow):
             if success and job['action'] == 'receive':
                 self.navigate_local(self.local_dir)
             if not success:
-                self.append_log(f'文件操作退出码：{code}；目标文件未覆盖。')
+                self.append_log(f'文件操作退出码：{code}；请查看以上日志确认结果。')
         self.update_controls()
         QTimer.singleShot(0, self.start_next)
 
@@ -680,6 +759,7 @@ class Application(QMainWindow):
         self.remote_up.setEnabled(not busy and self.connected)
         self.remote_path.setEnabled(not busy and self.connected)
         self.remote_refresh.setEnabled(not busy and self.connected)
+        self.remote_mkdir_button.setEnabled(not busy and self.connected)
         self.cancel_button.setEnabled(busy and not self.cancel_requested)
 
     def update_elapsed(self):
@@ -687,7 +767,7 @@ class Application(QMainWindow):
             elapsed = int(time.monotonic() - self.started)
             self.statusBar().showMessage(f'操作进行中  {elapsed // 60:02d}:{elapsed % 60:02d}   ·   上传与下载完成后核对 SHA256')
         else:
-            self.statusBar().showMessage('SHA256 校验 · 拒绝覆盖同名文件 · 按需读取板端目录')
+            self.statusBar().showMessage('SHA256 校验 · 覆盖前确认 · 按需读取板端目录')
 
     def cancel(self):
         for job in self.jobs:
