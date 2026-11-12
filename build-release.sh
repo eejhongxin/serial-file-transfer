@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-release_name='serial-transfer-gui-2.2.0'
+release_name='serial-transfer-gui-2.3.0'
 work_dir="$(mktemp -d)"
 trap 'rm -rf -- "$work_dir"' EXIT
 mkdir -p -- "$work_dir/$release_name" "$source_dir/dist"
-for name in app.py serial_transfer.py README.md requirements.txt install.sh uninstall.sh icon.svg; do
+for name in serial_terminal.py app.py serial_transfer.py README.md requirements.txt install.sh uninstall.sh icon.svg; do
     cp -- "$source_dir/$name" "$work_dir/$release_name/$name"
 done
 if [ -d "$source_dir/compat" ]; then

@@ -29,7 +29,7 @@ home = Path.home()
 app = home / '.local/share/serial-transfer-gui'
 bin_dir = home / '.local/bin'
 desktop_dir = home / '.local/share/applications'
-files = ('app.py', 'serial_transfer.py', 'README.md', 'requirements.txt', 'uninstall.sh', 'icon.svg')
+files = ('serial_terminal.py', 'app.py', 'serial_transfer.py', 'README.md', 'requirements.txt', 'uninstall.sh', 'icon.svg')
 if any(c in str(home) for c in '\n\r'):
     raise SystemExit('安装路径不能含换行符')
 for name in files:

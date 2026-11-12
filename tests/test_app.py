@@ -231,6 +231,30 @@ class WindowTest(unittest.TestCase):
                     refresh.assert_not_called()
                     self.assertIn('失败', self.window.status_label.text())
 
+    def test_terminal_connect_handoff_resume_and_disconnect(self):
+        events = []
+        payload = json.dumps(self.listing())
+        with patch.object(self.window.terminal, 'open_port', side_effect=lambda *args: events.append('open')), \
+                patch.object(self.window.terminal, 'close_port', side_effect=lambda: events.append('close')), \
+                patch.object(app, 'backend_command', return_value=child('print(' + repr(payload) + ')')):
+            self.window.connect_board()
+            self.wait_finished()
+            self.assertIs(self.window.tabs.currentWidget(), self.window.terminal)
+            self.assertIn('open', events)
+            events.clear()
+            self.window.request_listing('/userdata')
+            self.assertEqual(events[0], 'close')
+            self.assertFalse(self.window.terminal.view.isEnabled())
+            self.wait_for(lambda: self.window.process is None and events[-1] == 'open')
+            self.assertTrue(self.window.terminal.view.isEnabled())
+            self.window.tabs.setCurrentIndex(0)
+            self.assertEqual(events[-1], 'close')
+            self.window.tabs.setCurrentWidget(self.window.terminal)
+            self.assertEqual(events[-1], 'open')
+            self.window.disconnect_board()
+            self.assertEqual(events[-1], 'close')
+            self.assertFalse(self.window.connected)
+
     def test_zero_exit_without_listing_does_not_connect(self):
         with patch.object(app, 'backend_command', return_value=child('print("no listing")')):
             self.window.connect_board()

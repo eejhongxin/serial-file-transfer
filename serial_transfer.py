@@ -32,8 +32,9 @@ def emit_event(kind, **fields):
 
 
 class Console:
-    def __init__(self, port, baud=None):
+    def __init__(self, port, baud=None, require_prompt=True):
         self.port = port
+        self.require_prompt = require_prompt
         self.baud = baud
         self.fd = None
         self.old = None
@@ -89,6 +90,8 @@ class Console:
                             array.array('i', [termios.TIOCM_DTR | termios.TIOCM_RTS]))
             except OSError:
                 pass
+            if not self.require_prompt:
+                return self
             self.send('\r')
             response = self.read_until_prompt(8)
             if not re.search(rb'#[ \t]*$', response.rstrip(b'\r\n')):

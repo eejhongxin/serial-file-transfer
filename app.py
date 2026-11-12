@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
     QTreeView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from serial_terminal import SerialTerminal
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -130,6 +132,7 @@ class Application(QMainWindow):
         super().__init__()
         self.settings = QSettings('SerialTransfer', 'Desktop')
         self.connected = False
+        self.show_terminal_after_connect = False
         self.remote_dir = '/'
         self.remote_entries = []
         self.local_dir = str(Path.home())
@@ -211,6 +214,10 @@ class Application(QMainWindow):
         self.log.setReadOnly(True)
         self.log.document().setMaximumBlockCount(3000)
         self.tabs.addTab(self.log, '连接与传输日志')
+        self.terminal = SerialTerminal(self)
+        self.terminal.failed.connect(lambda message: self.append_log('串口终端：' + message))
+        self.tabs.addTab(self.terminal, '串口终端')
+        self.tabs.currentChanged.connect(self.sync_terminal)
         self.vertical_split.addWidget(self.tabs)
         self.vertical_split.setSizes([520, 210])
         layout.addWidget(self.vertical_split, 1)
@@ -251,9 +258,10 @@ class Application(QMainWindow):
         help_menu.addAction('使用说明', lambda: QMessageBox.information(self, '串口文件管理',
             '1. 板端登录 root，并退出其他串口终端。\n2. 选择串口，点击连接。\n'
             '3. 左边是本地文件，右边是板端文件；双击目录进入。\n'
-            '4. 选择普通文件，点击上传或下载。支持多选文件排队传输。\n\n'
+            '4. 选择文件或文件夹上传；下载支持普通文件。支持排队传输。\n'
+            '5. 串口终端页签可直接输入命令、Tab 补全、Ctrl+C 中断。\n\n'
             '板端目录按需读取，包含隐藏文件；不会递归扫描整个根目录。\n'
-            '暂不递归传输文件夹；同名目标会拒绝覆盖。'))
+            '上传支持文件夹；覆盖前会确认。文件操作前请先回到 root shell。'))
 
     def build_connection_bar(self):
         bar = QHBoxLayout()
@@ -535,11 +543,13 @@ class Application(QMainWindow):
     def connect_board(self):
         if self.process is not None:
             return
+        self.show_terminal_after_connect = True
         self.request_listing('/', connecting=True)
 
     def disconnect_board(self):
         if self.process is not None:
             return
+        self.terminal.close_port()
         self.connected = False
         self.remote_entries = []
         self.remote_tree.clear()
@@ -547,6 +557,16 @@ class Application(QMainWindow):
         self.connection_hint.setText('串口已释放。可在其他串口终端中继续操作板子。')
         self.status_label.setText('未连接')
         self.update_controls()
+
+    def sync_terminal(self, *args):
+        active = (self.connected and self.process is None and not self.jobs
+                  and self.tabs.currentWidget() is self.terminal)
+        if active:
+            baud = self.baud_box.currentText()
+            self.terminal.open_port(self.port_box.currentText().strip(),
+                                    None if baud == '保持当前' else int(baud))
+        else:
+            self.terminal.close_port()
 
     def request_listing(self, path, connecting=False):
         if self.process is not None or (not self.connected and not connecting):
@@ -675,6 +695,8 @@ class Application(QMainWindow):
             if self.refresh_after_queue and self.connected:
                 self.refresh_after_queue = False
                 self.request_listing(self.remote_dir)
+            else:
+                self.sync_terminal()
             return
         job = self.jobs.pop(0)
         if job['action'] == 'receive':
@@ -728,6 +750,7 @@ class Application(QMainWindow):
         self.launch(command, job)
 
     def launch(self, command, job):
+        self.terminal.close_port()
         self.current_job = job
         self.stdout_buffer = ''
         self.output_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
@@ -805,9 +828,16 @@ class Application(QMainWindow):
                 self.connected = True
                 self.settings.setValue('port', self.port_box.currentText())
                 self.settings.setValue('baud', self.baud_box.currentText())
-                self.connection_hint.setText('已连接 · 每次目录读取和文件传输完成后释放串口；请勿同时打开其他串口终端。')
+                self.connection_hint.setText('已连接 · 串口终端支持直接交互；文件操作期间自动暂停。请勿同时打开其他串口程序。')
                 self.status_label.setText('目录读取完成')
+                if self.show_terminal_after_connect:
+                    self.show_terminal_after_connect = False
+                    self.vertical_split.setSizes([360, 370])
+                    self.tabs.setCurrentWidget(self.terminal)
+                    self.terminal.write(b'\r')
+                    self.terminal.view.setFocus()
             else:
+                self.show_terminal_after_connect = False
                 self.remote_path.setText(self.remote_dir)
                 self.status_label.setText('操作已取消' if self.cancel_requested else '目录读取失败，请查看日志')
                 self.tabs.setCurrentIndex(1)
@@ -843,6 +873,7 @@ class Application(QMainWindow):
         self.remote_refresh.setEnabled(not busy and self.connected)
         self.remote_mkdir_button.setEnabled(not busy and self.connected)
         self.cancel_button.setEnabled(busy and not self.cancel_requested)
+        self.terminal.view.setEnabled(not busy and self.connected)
 
     def update_elapsed(self):
         if self.process is not None:
@@ -887,6 +918,7 @@ class Application(QMainWindow):
             QMessageBox.information(self, '操作进行中', '请先取消当前操作，等待串口恢复后再关闭窗口。')
             event.ignore()
         else:
+            self.terminal.close_port()
             event.accept()
 
 
