@@ -167,6 +167,70 @@ class WindowTest(unittest.TestCase):
                     self.assertIn('保留原文件', self.window.queue_table.item(self.window.queue_table.rowCount() - 1, 4).text())
         self.assertEqual(target.read_bytes(), b'old')
 
+    def select_local(self, path):
+        from PySide6.QtCore import QItemSelectionModel
+        model = self.window.local_model
+        root = self.window.local_tree.rootIndex()
+        self.wait_for(lambda: any(model.filePath(model.index(row, 0, root)) == str(path)
+                                 for row in range(model.rowCount(root))))
+        self.window.local_tree.selectionModel().select(model.index(str(path)),
+            QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+        self.assertEqual(len(self.window.local_tree.selectionModel().selectedRows(0)), 1)
+
+    def test_folder_selection_queues_tree_and_confirms_merge(self):
+        folder = Path(self.temp.name) / 'folder'
+        folder.mkdir()
+        self.select_local(folder)
+        self.window.connected = True
+        with patch.object(self.window, 'start_next'):
+            self.window.upload_selected()
+        self.assertEqual(self.window.jobs[0]['action'], 'send-tree')
+        with patch.object(app.QMessageBox, 'question', return_value=app.QMessageBox.StandardButton.Yes), \
+                patch.object(self.window, 'launch') as launch:
+            self.window.start_next()
+        command = launch.call_args.args[0]
+        self.assertIn('send-tree', command)
+        self.assertIn('--overwrite', command)
+        self.assertEqual(command[command.index('--source') + 1], str(folder))
+
+    def test_local_rename_nonempty_folder_and_collision(self):
+        folder = Path(self.temp.name) / 'old'
+        folder.mkdir()
+        (folder / 'data').write_bytes(b'keep')
+        self.select_local(folder)
+        with patch.object(app.QInputDialog, 'getText', return_value=("新 ' name", True)):
+            self.window.rename_local_entry()
+        target = folder.with_name("新 ' name")
+        self.assertFalse(folder.exists())
+        self.assertEqual((target / 'data').read_bytes(), b'keep')
+        folder.mkdir()
+        self.select_local(folder)
+        with patch.object(app.QInputDialog, 'getText', return_value=(target.name, True)), \
+                patch.object(app.QMessageBox, 'warning') as warning:
+            self.window.rename_local_entry()
+        warning.assert_called_once()
+        self.assertTrue(folder.is_dir())
+        self.assertEqual((target / 'data').read_bytes(), b'keep')
+
+    def test_remote_rename_refresh_and_failure(self):
+        self.window.set_listing(self.listing())
+        self.window.connected = True
+        item = self.window.remote_tree.topLevelItem(0)
+        item.setSelected(True)
+        for exit_code in (0, 1):
+            with patch.object(app.QInputDialog, 'getText', return_value=('renamed', True)), \
+                    patch.object(app, 'backend_command', return_value=child(f'import sys; sys.exit({exit_code})')), \
+                    patch.object(self.window, 'request_listing') as refresh:
+                self.window.rename_remote_entry()
+                self.assertEqual(self.window.current_job['action'], 'rename')
+                if exit_code == 0:
+                    self.wait_for(lambda: refresh.called)
+                    refresh.assert_called_once_with('/userdata/中文')
+                else:
+                    self.wait_finished()
+                    refresh.assert_not_called()
+                    self.assertIn('失败', self.window.status_label.text())
+
     def test_zero_exit_without_listing_does_not_connect(self):
         with patch.object(app, 'backend_command', return_value=child('print("no listing")')):
             self.window.connect_board()

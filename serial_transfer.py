@@ -412,23 +412,93 @@ def make_directory(args, parser):
     emit_event('status', message='板端文件夹已创建：' + args.path)
 
 
+def rename_entry(args, parser):
+    source, output = Path(args.source), Path(args.output)
+    if (not source.is_absolute() or source.parent != output.parent or source == output
+            or any(c in args.source + args.output for c in '\r\n\0')
+            or '..' in source.parts or '..' in output.parts
+            or source.name in ('', '.', '..') or output.name in ('', '.', '..')):
+        parser.error('Rename requires different absolute sibling paths without control characters')
+    old, new = shlex.quote(args.source), shlex.quote(args.output)
+    with Console(args.port, getattr(args, 'baud', None)) as console:
+        console.checked_command(
+            f'test -e {old} || test -L {old}')
+        console.checked_command(
+            f'mv -nT -- {old} {new} && '
+            f'if [ -e {old} ] || [ -L {old} ]; then '
+            "echo 'Rename skipped: destination already exists'; exit 1; fi")
+    emit_event('status', message='重命名成功：' + args.output)
+
+
+def send_tree(args, parser):
+    source = Path(args.source)
+    destination = Path(args.output)
+    if (source.is_symlink() or not source.is_dir() or not destination.is_absolute()
+            or '..' in destination.parts
+            or any(c in args.output for c in '\r\n\0')):
+        parser.error('Folder upload requires a local directory and an absolute board path')
+    # Build the plan first, including empty/hidden directories. Never follow links.
+    directories, files = [source], []
+    def walk_error(error):
+        raise error
+    for current, names, filenames in os.walk(source, followlinks=False, onerror=walk_error):
+        current = Path(current)
+        for name in list(names):
+            path = current / name
+            if path.is_symlink():
+                names.remove(name)
+                print('Skipped symlink: ' + str(path), flush=True)
+            else:
+                directories.append(path)
+        for name in filenames:
+            path = current / name
+            if stat.S_ISREG(path.lstat().st_mode):
+                files.append(path)
+            else:
+                print('Skipped symlink or special file: ' + str(path), flush=True)
+    for path in directories + files:
+        if any(c in str(path.relative_to(source)) for c in '\r\n\0'):
+            parser.error('Folder entries cannot contain CR, LF or NUL')
+    # Check every board ancestor so a directory link cannot redirect the tree.
+    targets = [destination]
+    targets.extend(destination / path.relative_to(source) for path in directories[1:])
+    with Console(args.port, getattr(args, 'baud', None)) as console:
+        checked = set()
+        for target in targets:
+            for directory in [*reversed(target.parents), target]:
+                if directory == Path('/') or directory in checked:
+                    continue
+                quoted = shlex.quote(str(directory))
+                console.checked_command(
+                    f'if [ -L {quoted} ]; then echo "Directory symlink refused"; exit 1; fi; '
+                    f'if [ -e {quoted} ]; then test -d {quoted}; else mkdir -- {quoted}; fi')
+                checked.add(directory)
+    for index, path in enumerate(files, 1):
+        emit_event('status', message=f'上传文件夹：{index}/{len(files)} · {path.relative_to(source)}')
+        send_file(argparse.Namespace(port=args.port, baud=getattr(args, 'baud', None),
+                  source=path, output=str(destination / path.relative_to(source)),
+                  overwrite=getattr(args, 'overwrite', False)), parser)
+    emit_event('status', message=f'文件夹上传完成：{len(files)} 个文件，{len(directories)} 个目录')
+
+
 def main():
     global _EVENTS
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='direction', required=True)
     for name, description, action in (
             ('receive', 'Download a board file to this computer', receive_file),
-            ('send', 'Upload a local file to the board', send_file)):
+            ('send', 'Upload a local file to the board', send_file),
+            ('send-tree', 'Upload a local directory recursively', send_tree)):
         command = commands.add_parser(name, help=description, description=description)
         command.add_argument('--port', default='/dev/ttyACM0', help='Local serial device')
         command.add_argument('--baud', type=int, default=None,
                              help='Baud rate; omit to preserve current port speed')
         command.add_argument('--events', action='store_true',
                              help='Emit JSON status/progress lines alongside text logs')
-        command.add_argument('--source', required=True, type=Path if name == 'send' else str,
-                             help='Local file' if name == 'send' else 'Board file')
-        command.add_argument('--output', required=True, type=str if name == 'send' else Path,
-                             help='Board file (absolute path)' if name == 'send' else 'Local file')
+        command.add_argument('--source', required=True, type=Path if name in ('send', 'send-tree') else str,
+                             help='Board file' if name == 'receive' else 'Local file or directory')
+        command.add_argument('--output', required=True, type=str if name in ('send', 'send-tree') else Path,
+                             help='Local file' if name == 'receive' else 'Board absolute path')
         command.add_argument('--overwrite', action='store_true',
                              help='Replace an existing file only after successful verification')
         command.set_defaults(action=action, command_parser=command)
@@ -445,6 +515,13 @@ def main():
     mkdir.add_argument('--events', action='store_true')
     mkdir.add_argument('--path', required=True)
     mkdir.set_defaults(action=make_directory, command_parser=mkdir)
+    rename = commands.add_parser('rename', help='Rename a board entry without replacing another')
+    rename.add_argument('--port', default='/dev/ttyACM0')
+    rename.add_argument('--baud', type=int, default=None)
+    rename.add_argument('--events', action='store_true')
+    rename.add_argument('--source', required=True)
+    rename.add_argument('--output', required=True)
+    rename.set_defaults(action=rename_entry, command_parser=rename)
     arguments = sys.argv[1:]
     if Path(sys.argv[0]).name == 'serial-receive':
         arguments = ['receive', *arguments]

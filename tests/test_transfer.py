@@ -257,6 +257,68 @@ class TransferTest(unittest.TestCase):
             self.assertEqual(shell.attributes(), shell.original)
         self.assertEqual(list(self.root.iterdir()), [target])
 
+    def test_tree_cli_nested_empty_hidden_and_merge(self):
+        source = self.root / "中文 ' folder"
+        (source / 'nested' / 'empty').mkdir(parents=True)
+        (source / '.hidden').write_bytes(b'hidden')
+        (source / 'nested' / 'data').write_bytes(bytes(range(256)))
+        (source / 'link').symlink_to(source / 'nested', target_is_directory=True)
+        target = self.root / 'board'
+        (target / 'nested').mkdir(parents=True)
+        (target / 'nested' / 'data').write_bytes(b'old')
+        (target / 'keep').write_bytes(b'keep')
+        with Shell() as shell:
+            result = REAL_RUN([sys.executable, str(MODULE), 'send-tree', '--port', shell.port,
+                              '--source', str(source), '--output', str(target), '--overwrite'],
+                              capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual((target / 'nested' / 'data').read_bytes(), bytes(range(256)))
+        self.assertTrue((target / 'nested' / 'empty').is_dir())
+        self.assertEqual((target / '.hidden').read_bytes(), b'hidden')
+        self.assertEqual((target / 'keep').read_bytes(), b'keep')
+        self.assertFalse((target / 'link').exists())
+        self.assertIn('Skipped symlink', result.stdout)
+
+    def test_tree_refuses_remote_directory_link_and_file_conflict(self):
+        source = self.root / 'source'
+        source.mkdir()
+        (source / 'data').write_bytes(b'new')
+        real = self.root / 'real'
+        real.mkdir()
+        target = self.root / 'target'
+        target.symlink_to(real)
+        with Shell() as shell:
+            args = self.args(shell, source, str(target))
+            args.overwrite = True
+            with self.assertRaisesRegex(RuntimeError, 'symlink refused'):
+                backend.send_tree(args, self.parser)
+        self.assertEqual(list(real.iterdir()), [])
+        target.unlink()
+        target.mkdir()
+        (target / 'data').write_bytes(b'keep')
+        with Shell() as shell:
+            with self.assertRaisesRegex(RuntimeError, 'Output already exists'):
+                backend.send_tree(self.args(shell, source, str(target)), self.parser)
+        self.assertEqual((target / 'data').read_bytes(), b'keep')
+
+    def test_remote_rename_directory_cli_and_collision(self):
+        old, new = self.root / "旧 ' folder", self.root / 'new name'
+        old.mkdir()
+        (old / 'data').write_bytes(b'keep')
+        with Shell() as shell:
+            command = [sys.executable, str(MODULE), 'rename', '--port', shell.port,
+                       '--source', str(old), '--output', str(new)]
+            result = REAL_RUN(command, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertFalse(old.exists())
+            self.assertEqual((new / 'data').read_bytes(), b'keep')
+            old.mkdir()
+            (old / 'other').write_bytes(b'other')
+            result = REAL_RUN(command, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((new / 'data').read_bytes(), b'keep')
+            self.assertEqual((old / 'other').read_bytes(), b'other')
+
     def test_keyboard_interrupt_restores_console(self):
         with Shell() as shell:
             with self.assertRaises(KeyboardInterrupt):

@@ -44,7 +44,7 @@ def backend_command(action, port, baud):
 
 
 def transfer_command(direction, port, baud, local, remote, overwrite=False):
-    if direction not in ('send', 'receive'):
+    if direction not in ('send', 'receive', 'send-tree'):
         raise ValueError('请选择传输方向。')
     if not remote.startswith('/') or remote.endswith('/') or any(c in remote for c in '\r\n\x00'):
         raise ValueError('板端文件必须是完整的绝对路径。')
@@ -53,6 +53,8 @@ def transfer_command(direction, port, baud, local, remote, overwrite=False):
     path = Path(local).expanduser().absolute()
     if direction == 'send' and not path.is_file():
         raise ValueError('要上传的本地文件不存在。')
+    if direction == 'send-tree' and (path.is_symlink() or not path.is_dir()):
+        raise ValueError('要上传的本地文件夹不存在或是符号链接。')
     if direction == 'receive':
         if os.path.lexists(path) and not overwrite:
             raise ValueError('本地目标已存在，请更换文件名。')
@@ -60,7 +62,7 @@ def transfer_command(direction, port, baud, local, remote, overwrite=False):
             raise ValueError('目标是文件夹，不能用文件覆盖。')
         if not path.parent.is_dir():
             raise ValueError('本地保存目录不存在。')
-    source, output = (str(path), remote) if direction == 'send' else (remote, str(path))
+    source, output = (str(path), remote) if direction in ('send', 'send-tree') else (remote, str(path))
     return backend_command(direction, port, baud) + ['--source', source, '--output', output] + (['--overwrite'] if overwrite else [])
 
 
@@ -338,11 +340,16 @@ class Application(QMainWindow):
         self.local_model.setHeaderData(2, Qt.Orientation.Horizontal, '类型')
         self.local_model.setHeaderData(3, Qt.Orientation.Horizontal, '修改时间')
         layout.addWidget(self.local_tree, 1)
-        self.local_info = QLabel('双击目录进入；选择文件后上传。')
+        self.local_info = QLabel('双击目录进入；选择文件或文件夹后上传。')
         self.local_info.setStyleSheet('color: #64748b; padding-top: 3px;')
         layout.addWidget(self.local_info)
         self.local_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.local_tree.customContextMenuRequested.connect(self.local_context_menu)
+        rename = QAction('重命名', self.local_tree)
+        rename.setShortcut('F2')
+        rename.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        rename.triggered.connect(self.rename_local_entry)
+        self.local_tree.addAction(rename)
         return panel
 
     def build_remote_panel(self):
@@ -380,6 +387,11 @@ class Application(QMainWindow):
         self.remote_tree.itemDoubleClicked.connect(self.remote_double_click)
         self.remote_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.remote_tree.customContextMenuRequested.connect(self.remote_context_menu)
+        rename = QAction('重命名', self.remote_tree)
+        rename.setShortcut('F2')
+        rename.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        rename.triggered.connect(self.rename_remote_entry)
+        self.remote_tree.addAction(rename)
         layout.addWidget(self.remote_tree, 1)
         self.remote_info = QLabel('尚未连接。连接后可从 / 浏览整个板端文件系统。')
         self.remote_info.setStyleSheet('color: #64748b; padding-top: 3px;')
@@ -388,10 +400,12 @@ class Application(QMainWindow):
 
     def local_context_menu(self, position):
         menu = QMenu(self)
-        action = menu.addAction('上传所选文件 →')
+        action = menu.addAction('上传所选文件 / 文件夹 →')
         action.setEnabled(self.connected and self.process is None)
         action.triggered.connect(self.upload_selected)
         menu.addAction('新建文件夹…', self.create_local_directory)
+        rename = menu.addAction('重命名…', self.rename_local_entry)
+        rename.setEnabled(self.process is None and len(self.local_tree.selectionModel().selectedRows(0)) == 1)
         menu.exec(self.local_tree.viewport().mapToGlobal(position))
 
     def remote_context_menu(self, position):
@@ -401,10 +415,14 @@ class Application(QMainWindow):
         action.triggered.connect(self.download_selected)
         mkdir = menu.addAction('新建文件夹…', self.create_remote_directory)
         mkdir.setEnabled(self.connected and self.process is None)
+        rename = menu.addAction('重命名…', self.rename_remote_entry)
+        rename.setEnabled(self.connected and self.process is None and len(self.remote_tree.selectedItems()) == 1)
         menu.exec(self.remote_tree.viewport().mapToGlobal(position))
 
-    def directory_name(self):
-        name, accepted = QInputDialog.getText(self, '新建文件夹', '文件夹名称：')
+    def directory_name(self, old_name=None):
+        name, accepted = QInputDialog.getText(self, '重命名' if old_name is not None else '新建文件夹',
+                                             '新名称：' if old_name is not None else '文件夹名称：',
+                                             text=old_name or '')
         if not accepted:
             return None
         if not name or name in ('.', '..') or ('/' in name or any(ord(c) < 32 or ord(c) == 127 for c in name)):
@@ -437,6 +455,55 @@ class Application(QMainWindow):
             QMessageBox.warning(self, '创建失败', str(error))
             return
         self.launch(command + ['--path', path], {'action': 'mkdir', 'path': path})
+
+    def rename_local_entry(self):
+        if self.process is not None:
+            return
+        indexes = self.local_tree.selectionModel().selectedRows(0)
+        if len(indexes) != 1:
+            return
+        source = Path(self.local_model.filePath(indexes[0]))
+        name = self.directory_name(source.name)
+        if name is None or name == source.name:
+            return
+        target = source.with_name(name)
+        try:
+            # Linux atomic no-replace rename also works for nonempty directories.
+            libc = ctypes.CDLL(None, use_errno=True)
+            rename = libc.renameat2
+            rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            if rename(-100, os.fsencode(source), -100, os.fsencode(target), 1) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), str(target))
+        except (OSError, AttributeError) as error:
+            QMessageBox.warning(self, '重命名失败', str(error))
+            return
+        self.navigate_local(self.local_dir)
+        self.status_label.setText('重命名成功：' + name)
+
+    def rename_remote_entry(self):
+        if not self.connected or self.process is not None:
+            return
+        items = self.remote_tree.selectedItems()
+        if len(items) != 1:
+            return
+        entry = items[0].data(0, Qt.ItemDataRole.UserRole)
+        name = self.directory_name(entry['name'])
+        if name is None or name == entry['name']:
+            return
+        source = str(PurePosixPath(self.remote_dir) / entry['name'])
+        target = str(PurePosixPath(self.remote_dir) / name)
+        if any(c in source + target for c in '\r\n\x00'):
+            QMessageBox.warning(self, '重命名失败', '暂不支持含换行或回车的路径。')
+            return
+        try:
+            command = backend_command('rename', self.port_box.currentText().strip(), self.baud_box.currentText())
+        except ValueError as error:
+            QMessageBox.warning(self, '重命名失败', str(error))
+            return
+        self.launch(command + ['--source', source, '--output', target],
+                    {'action': 'rename', 'path': source, 'target': target})
 
     def append_log(self, message):
         self.log.appendPlainText(time.strftime('%H:%M:%S  ') + message.rstrip())
@@ -547,14 +614,17 @@ class Application(QMainWindow):
             self.download_selected()
 
     def upload_selected(self):
-        if not self.connected:
+        if not self.connected or self.process is not None:
             return
         indexes = self.local_tree.selectionModel().selectedRows(0)
         paths = [Path(self.local_model.filePath(index)) for index in indexes]
         skipped = []
         for path in paths:
+            if path.is_dir() and not path.is_symlink():
+                self.enqueue('send-tree', str(path), str(PurePosixPath(self.remote_dir) / path.name), 0)
+                continue
             try:
-                regular = stat.S_ISREG(path.stat().st_mode)
+                regular = stat.S_ISREG(path.lstat().st_mode)
             except OSError:
                 regular = False
             if not regular:
@@ -562,9 +632,9 @@ class Application(QMainWindow):
                 continue
             self.enqueue('send', str(path), str(PurePosixPath(self.remote_dir) / path.name), path.stat().st_size)
         if skipped:
-            self.append_log('已跳过目录或特殊文件：' + '、'.join(skipped))
+            self.append_log('已跳过符号链接或特殊文件：' + '、'.join(skipped))
         if not paths:
-            self.status_label.setText('请先在左侧选择要上传的文件。')
+            self.status_label.setText('请先在左侧选择要上传的文件或文件夹。')
         self.start_next()
 
     def download_selected(self):
@@ -588,8 +658,8 @@ class Application(QMainWindow):
     def enqueue(self, action, local, remote, size):
         row = self.queue_table.rowCount()
         self.queue_table.insertRow(row)
-        values = ['上传 →' if action == 'send' else '← 下载', Path(local).name,
-                  str(PurePosixPath(remote).parent) if action == 'send' else str(Path(local).parent),
+        values = ['上传 →' if action in ('send', 'send-tree') else '← 下载', Path(local).name,
+                  str(PurePosixPath(remote).parent) if action in ('send', 'send-tree') else str(Path(local).parent),
                   human_size(size), '等待中']
         for column, text in enumerate(values):
             item = QTableWidgetItem(text)
@@ -618,7 +688,19 @@ class Application(QMainWindow):
             directory = exists and self.is_directory(entry)
             target = job['remote']
         overwrite = False
-        if exists:
+        if job['action'] == 'send-tree':
+            answer = QMessageBox.question(self, '上传整个文件夹？',
+                display_name(job['local']) + '\n→ ' + display_name(job['remote']) +
+                '\n\n将上传子目录、隐藏文件和空目录。同名目录合并，同名文件校验后覆盖。'
+                '\n符号链接和特殊文件会跳过并记录日志。确认继续？',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                self.queue_table.item(job['row'], 4).setText('已跳过')
+                QTimer.singleShot(0, self.start_next)
+                return
+            overwrite = True
+        elif exists:
             if directory:
                 self.queue_table.item(job['row'], 4).setText('已跳过：目标是文件夹')
                 self.append_log('不能用文件覆盖文件夹：' + target)
@@ -658,9 +740,9 @@ class Application(QMainWindow):
         self.process.started.connect(self.process_started)
         self.process.finished.connect(self.operation_finished)
         self.process.errorOccurred.connect(self.process_error)
-        self.append_log((('读取板端目录：' if job['action'] == 'list' else '新建板端文件夹：') + job['path']) if job['action'] in ('list', 'mkdir') else
-                        ('上传：' if job['action'] == 'send' else '下载：') + job['remote'])
-        self.status_label.setText('正在读取目录…' if job['action'] == 'list' else ('正在创建文件夹…' if job['action'] == 'mkdir' else '正在传输…'))
+        self.append_log(({'list': '读取板端目录：', 'mkdir': '新建板端文件夹：', 'rename': '重命名：'}[job['action']] + job['path']) if job['action'] in ('list', 'mkdir', 'rename') else
+                        ('上传：' if job['action'] in ('send', 'send-tree') else '下载：') + job['remote'])
+        self.status_label.setText('正在读取目录…' if job['action'] == 'list' else ('正在重命名…' if job['action'] == 'rename' else ('正在创建文件夹…' if job['action'] == 'mkdir' else '正在传输…')))
         self.update_controls()
         self.process.start(command[0], command[1:])
 
@@ -729,17 +811,17 @@ class Application(QMainWindow):
                 self.remote_path.setText(self.remote_dir)
                 self.status_label.setText('操作已取消' if self.cancel_requested else '目录读取失败，请查看日志')
                 self.tabs.setCurrentIndex(1)
-        elif job['action'] == 'mkdir':
-            self.status_label.setText('文件夹创建成功' if success else ('操作已取消' if self.cancel_requested else '创建失败，请查看日志'))
+        elif job['action'] in ('mkdir', 'rename'):
+            self.status_label.setText(('重命名成功' if job['action'] == 'rename' else '文件夹创建成功') if success else ('操作已取消' if self.cancel_requested else '操作失败，请查看日志'))
             if success:
                 self.refresh_after_queue = True
             else:
                 self.tabs.setCurrentIndex(1)
         else:
-            text = '完成 · 校验通过' if success else ('已取消' if self.cancel_requested else '失败 · 查看日志')
+            text = ('完成 · 文件夹已上传' if job['action'] == 'send-tree' else '完成 · 校验通过') if success else ('已取消' if self.cancel_requested else '失败 · 查看日志')
             self.queue_table.item(job['row'], 4).setText(text)
             self.status_label.setText(text)
-            if success and job['action'] == 'send':
+            if job['action'] in ('send', 'send-tree'):
                 self.refresh_after_queue = True
             if success and job['action'] == 'receive':
                 self.navigate_local(self.local_dir)
